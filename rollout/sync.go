@@ -378,6 +378,12 @@ func (c *rolloutContext) scaleReplicaSet(rs *appsv1.ReplicaSet, newScale int32, 
 			revision, _ := replicasetutil.Revision(rs)
 			c.recorder.Eventf(rollout, record.EventOptions{EventReason: conditions.ScalingReplicaSetReason}, conditions.ScalingReplicaSetMessage, scalingOperation, rs.Name, revision, oldScale, newScale)
 			c.replicaSetInformer.GetIndexer().Update(rs)
+			if rollout.Spec.WorkloadRef != nil && rollout.Spec.WorkloadRef.ScaleDown == v1alpha1.ScaleDownProgressively {
+				err = c.scaleDeployment(false, &oldScale, &newScale)
+				if err != nil {
+					return scaled, rs, err
+				}
+			}
 		}
 	}
 	return scaled, rs, err
@@ -1003,6 +1009,34 @@ func (c *rolloutContext) promoteStable(newStatus *v1alpha1.RolloutStatus, reason
 		revision, _ := replicasetutil.Revision(c.rollout)
 		c.recorder.Eventf(c.rollout, record.EventOptions{EventReason: conditions.RolloutCompletedReason},
 			conditions.RolloutCompletedMessage, revision, newStatus.CurrentPodHash, reason)
+
+		if c.rollout.Spec.WorkloadRef != nil && c.rollout.Spec.WorkloadRef.ScaleDown == v1alpha1.ScaleDownOnSuccess {
+			err := c.scaleDeployment(true, nil, nil)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *rolloutContext) scaleDeployment(scaleToZero bool, oldScale *int32, newScale *int32) error {
+	deploymentName := c.rollout.Spec.WorkloadRef.Name
+	namespace := c.rollout.Namespace
+	deployment, err := c.kubeclientset.AppsV1().Deployments(namespace).Get(context.TODO(), deploymentName, metav1.GetOptions{})
+	if err != nil {
+		c.log.Warnf("Failed to fetch deployment %s: %s", deploymentName, err.Error())
+		return err
+	}
+	if scaleToZero {
+		*deployment.Spec.Replicas = 0
+	} else {
+		*deployment.Spec.Replicas += *oldScale - *newScale
+	}
+	_, err = c.kubeclientset.AppsV1().Deployments(namespace).Update(context.TODO(), deployment, metav1.UpdateOptions{})
+	if err != nil {
+		c.log.Warnf("Failed to update deployment %s: %s", deploymentName, err.Error())
+		return err
 	}
 	return nil
 }

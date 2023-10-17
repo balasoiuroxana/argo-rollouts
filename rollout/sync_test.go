@@ -1,27 +1,35 @@
 package rollout
 
 import (
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	testclient "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/utils/pointer"
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
+
 	"github.com/argoproj/argo-rollouts/pkg/client/clientset/versioned/fake"
 	"github.com/argoproj/argo-rollouts/utils/annotations"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
 	"github.com/argoproj/argo-rollouts/utils/record"
 	timeutil "github.com/argoproj/argo-rollouts/utils/time"
+
+	"context"
 )
 
 func rs(name string, replicas int, selector map[string]string, timestamp metav1.Time, ownerRef *metav1.OwnerReference) *appsv1.ReplicaSet {
@@ -609,4 +617,231 @@ func Test_shouldFullPromote(t *testing.T) {
 
 	result = ctx.shouldFullPromote(newStatus)
 	assert.Equal(t, result, "Rollback within window")
+}
+
+type DeploymentActions interface {
+	Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.Deployment, error)
+	Update(ctx context.Context, deployment *appsv1.Deployment, opts metav1.UpdateOptions) (*appsv1.Deployment, error)
+}
+
+type KubeClientInterface interface {
+	Deployments(namespace string) DeploymentActions
+	AppsV1() AppV1Interface
+}
+
+type AppV1Interface interface {
+	Deployments(namespace string) DeploymentActions
+}
+
+type mockDeploymentInterface struct {
+	deployment *appsv1.Deployment
+}
+
+func (m *mockDeploymentInterface) Get(ctx context.Context, name string, opts metav1.GetOptions) (*appsv1.Deployment, error) {
+	return m.deployment, nil
+}
+
+func (m *mockDeploymentInterface) Update(ctx context.Context, deployment *appsv1.Deployment, opts metav1.UpdateOptions) (*appsv1.Deployment, error) {
+	m.deployment = deployment
+	return deployment, nil
+}
+
+type testKubeClient struct {
+	mockDeployment DeploymentActions
+}
+
+func (t *testKubeClient) AppsV1() AppV1Interface {
+	return t
+}
+
+func (t *testKubeClient) Deployments(namespace string) DeploymentActions {
+	return t.mockDeployment
+}
+
+type testRolloutContext struct {
+	*rolloutContext
+	kubeClient KubeClientInterface
+}
+
+func createTestRolloutContext(scaleDownMode string, initialReplicaSet *appsv1.ReplicaSet, deploymentReplicas int32, replicaSetInformer cache.SharedIndexInformer, deploymentExists bool, updateError error) *testRolloutContext {
+	ro := &v1alpha1.Rollout{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rollout-test",
+			Namespace: "default",
+		},
+		Spec: v1alpha1.RolloutSpec{
+			WorkloadRef: &v1alpha1.ObjectRef{
+				Name:      "workload-test",
+				ScaleDown: scaleDownMode,
+			},
+		},
+	}
+
+	fakeDeployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "workload-test",
+			Namespace: "default",
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &deploymentReplicas,
+		},
+	}
+
+	var k8sfakeClient *k8sfake.Clientset
+	if deploymentExists {
+		if initialReplicaSet != nil {
+			k8sfakeClient = k8sfake.NewSimpleClientset(initialReplicaSet, fakeDeployment)
+		} else {
+			k8sfakeClient = k8sfake.NewSimpleClientset(fakeDeployment)
+		}
+	} else {
+		if initialReplicaSet != nil {
+			k8sfakeClient = k8sfake.NewSimpleClientset(initialReplicaSet)
+		} else {
+			k8sfakeClient = k8sfake.NewSimpleClientset()
+		}
+	}
+
+	if updateError != nil {
+		k8sfakeClient.PrependReactor("update", "deployments", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+			return true, nil, updateError
+		})
+	}
+
+	mockDeploy := &mockDeploymentInterface{deployment: fakeDeployment}
+	testClient := &testKubeClient{mockDeployment: mockDeploy}
+
+	ctx := &testRolloutContext{
+		rolloutContext: &rolloutContext{
+			rollout:      ro,
+			pauseContext: &pauseContext{},
+			reconcilerBase: reconcilerBase{
+				argoprojclientset:  &fake.Clientset{},
+				kubeclientset:      k8sfakeClient,
+				recorder:           record.NewFakeEventRecorder(),
+				replicaSetInformer: replicaSetInformer,
+			},
+		},
+		kubeClient: testClient,
+	}
+	ctx.log = logutil.WithRollout(ctx.rollout)
+
+	return ctx
+}
+
+func TestScaleDownDeploymentOnSuccess(t *testing.T) {
+	ctx := createTestRolloutContext(v1alpha1.ScaleDownOnSuccess, nil, 5, nil, true, nil)
+	newStatus := &v1alpha1.RolloutStatus{
+		CurrentPodHash: "2f646bf702",
+		StableRS:       "15fb5ffc01",
+	}
+	err := ctx.promoteStable(newStatus, "reason")
+
+	assert.Nil(t, err)
+	k8sfakeClient := ctx.kubeclientset.(*k8sfake.Clientset)
+	updatedDeployment, err := k8sfakeClient.AppsV1().Deployments("default").Get(context.TODO(), "workload-test", metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Equal(t, int32(0), *updatedDeployment.Spec.Replicas)
+
+	// test scale deployment error
+	ctx = createTestRolloutContext(v1alpha1.ScaleDownOnSuccess, nil, 5, nil, false, nil)
+	newStatus = &v1alpha1.RolloutStatus{
+		CurrentPodHash: "2f646bf702",
+		StableRS:       "15fb5ffc01",
+	}
+	err = ctx.promoteStable(newStatus, "reason")
+
+	assert.NotNil(t, err)
+}
+
+func TestScaleDownProgressively(t *testing.T) {
+	initialScale := int32(3)
+	initialReplicaSet := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rs-test",
+			Namespace: "default",
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Replicas: &initialScale,
+		},
+	}
+
+	f := newFixture(t)
+	_, _, k8sInformer := f.newController(noResyncPeriodFunc)
+	replicaSetInformer := k8sInformer.Apps().V1().ReplicaSets().Informer()
+	ctx := createTestRolloutContext(v1alpha1.ScaleDownProgressively, initialReplicaSet, 5, replicaSetInformer, true, nil)
+	newScale := int32(5)
+	scaled, updatedRS, err := ctx.scaleReplicaSet(initialReplicaSet, newScale, ctx.rollout, "scaled up")
+
+	assert.Nil(t, err)
+	assert.True(t, scaled)
+	assert.Equal(t, newScale, *updatedRS.Spec.Replicas)
+	k8sfakeClient := ctx.kubeclientset.(*k8sfake.Clientset)
+	updatedDeployment, err := k8sfakeClient.AppsV1().Deployments("default").Get(context.TODO(), "workload-test", metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Equal(t, int32(3), *updatedDeployment.Spec.Replicas)
+
+	// test scale deployment error
+	ctx = createTestRolloutContext(v1alpha1.ScaleDownProgressively, initialReplicaSet, 5, replicaSetInformer, false, nil)
+	_, _, err = ctx.scaleReplicaSet(initialReplicaSet, newScale, ctx.rollout, "scaled up")
+	assert.NotNil(t, err)
+}
+
+func TestScaleDeployment(t *testing.T) {
+	tests := []struct {
+		name             string
+		scaleToZero      bool
+		oldScale         *int32
+		newScale         *int32
+		expectedCount    int32
+		deploymentExists bool
+		updateError      error
+	}{
+		{
+			name:             "Scale down to zero",
+			scaleToZero:      true,
+			oldScale:         nil,
+			newScale:         nil,
+			expectedCount:    0,
+			deploymentExists: true,
+		},
+		{
+			name:             "Scale down by difference",
+			scaleToZero:      false,
+			oldScale:         int32Ptr(2),
+			newScale:         int32Ptr(3),
+			expectedCount:    4,
+			deploymentExists: true,
+		},
+		{
+			name:             "Error fetching deployment",
+			scaleToZero:      false,
+			oldScale:         int32Ptr(2),
+			newScale:         int32Ptr(3),
+			deploymentExists: false,
+		},
+		{
+			name:             "Error updating deployment",
+			scaleToZero:      false,
+			oldScale:         int32Ptr(2),
+			newScale:         int32Ptr(3),
+			deploymentExists: true,
+			updateError:      fmt.Errorf("fake update error"),
+		},
+	}
+
+	for _, test := range tests {
+		ctx := createTestRolloutContext(v1alpha1.ScaleDownOnSuccess, nil, 5, nil, test.deploymentExists, test.updateError)
+		err := ctx.scaleDeployment(test.scaleToZero, test.oldScale, test.newScale)
+
+		if !test.deploymentExists || test.updateError != nil {
+			assert.NotNil(t, err)
+			continue
+		}
+		assert.Nil(t, err)
+		k8sfakeClient := ctx.kubeclientset.(*k8sfake.Clientset)
+		updatedDeployment, err := k8sfakeClient.AppsV1().Deployments("default").Get(context.TODO(), "workload-test", metav1.GetOptions{})
+		assert.Nil(t, err)
+		assert.Equal(t, *updatedDeployment.Spec.Replicas, test.expectedCount)
+	}
 }
